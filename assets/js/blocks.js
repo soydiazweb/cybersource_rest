@@ -48,11 +48,13 @@
 		);
 	}
 
-	function Label(props) { return el(props.components.PaymentMethodLabel, {text:decode(settings.title || 'Tarjeta de credito o debito')}); }
+	const labelText = decode(settings.title || 'Tarjeta de credito o debito');
+	function Label(props) { return el(props.components.PaymentMethodLabel, {text:labelText}); }
 
 	register({
 		name:'cybersource_rest',
 		label:el(Label),
+		ariaLabel:labelText,
 		content:el(Content),
 		edit:el('div', null, decode(settings.description || 'Pago seguro con CyberSource.')),
 		canMakePayment:function(){return true;},
