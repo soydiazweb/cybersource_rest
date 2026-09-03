@@ -1,10 +1,11 @@
 <?php
 /**
  * Plugin Name: CyberSource REST para WooCommerce
- * Plugin URI:  https://example.com/
+ * Plugin URI:  https://www.soydiaz.com
  * Description: Pasarela CyberSource REST con Payer Authentication 3-D Secure, device fingerprint, ambientes de pruebas/produccion y logs sanitizados.
- * Version:     1.1.3
- * Author:      ECI
+ * Version:     1.1.4
+ * Author:      www.soydiaz.com
+ * Author URI:  https://www.soydiaz.com
  * Text Domain: cybersource-rest-woocommerce
  * Requires at least: 6.4
  * Requires PHP: 7.4
@@ -15,7 +16,7 @@
 
 defined( 'ABSPATH' ) || exit;
 
-define( 'WC_CYBS_REST_VERSION', '1.1.3' );
+define( 'WC_CYBS_REST_VERSION', '1.1.4' );
 define( 'WC_CYBS_REST_FILE', __FILE__ );
 define( 'WC_CYBS_REST_PATH', plugin_dir_path( __FILE__ ) );
 define( 'WC_CYBS_REST_URL', plugin_dir_url( __FILE__ ) );

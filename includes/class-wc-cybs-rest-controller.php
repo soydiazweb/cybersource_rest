@@ -59,7 +59,7 @@ final class WC_Cybs_REST_Controller {
 
 		$payload = array(
 			'clientReferenceInformation' => array( 'code' => $this->reference_code() ),
-			'paymentInformation'         => array( 'card' => $this->card_without_cvc( $card ) ),
+			'paymentInformation'         => array( 'card' => $this->card_without_cvv( $card ) ),
 		);
 		$response = $gateway->client()->request( 'POST', '/risk/v1/authentication-setups', $payload, $this->reference_code() );
 		unset( $card, $payload );
@@ -113,7 +113,7 @@ final class WC_Cybs_REST_Controller {
 				'returnUrl'    => admin_url( 'admin-post.php?action=cybs_3ds_return' ),
 				'acsWindowSize'=> '03',
 			),
-			'paymentInformation' => array( 'card' => $this->card_without_cvc( $card ) ),
+			'paymentInformation' => array( 'card' => $this->card_without_cvv( $card ) ),
 			'orderInformation'   => array(
 				'amountDetails' => array( 'totalAmount' => $amount, 'currency' => $currency ),
 				'billTo'        => $bill_to,
@@ -162,7 +162,7 @@ final class WC_Cybs_REST_Controller {
 		$payload  = array(
 			'clientReferenceInformation' => array( 'code' => $this->reference_code() ),
 			'consumerAuthenticationInformation' => array( 'authenticationTransactionId' => $transaction_id ),
-			'paymentInformation' => array( 'card' => $this->card_without_cvc( $card ) ),
+			'paymentInformation' => array( 'card' => $this->card_without_cvv( $card ) ),
 			'orderInformation'   => array( 'amountDetails' => array( 'totalAmount' => $amount, 'currency' => $currency ) ),
 		);
 		$response = $gateway->client()->request( 'POST', '/risk/v1/authentication-results', $payload, $this->reference_code() );
@@ -240,7 +240,7 @@ final class WC_Cybs_REST_Controller {
 		return array( 'number' => $number, 'expirationMonth' => $month, 'expirationYear' => $year, 'type' => $type );
 	}
 
-	private function card_without_cvc( array $card ) { return array_intersect_key( $card, array_flip( array( 'number', 'expirationMonth', 'expirationYear', 'type' ) ) ); }
+	private function card_without_cvv( array $card ) { return array_intersect_key( $card, array_flip( array( 'number', 'expirationMonth', 'expirationYear', 'type' ) ) ); }
 
 	private function bill_to_from_request( WP_REST_Request $request ) {
 		$billing = is_array( $request->get_param( 'billing' ) ) ? $request->get_param( 'billing' ) : array();

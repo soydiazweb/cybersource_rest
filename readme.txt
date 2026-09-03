@@ -1,9 +1,11 @@
 === CyberSource REST para WooCommerce ===
-Contributors: eci
+Contributors: soydiaz
 Tags: woocommerce, cybersource, payments, 3ds, visa
+Author: www.soydiaz.com
+Author URI: https://www.soydiaz.com
 Requires at least: 6.4
 Requires PHP: 7.4
-Stable tag: 1.1.3
+Stable tag: 1.1.4
 License: GPLv2 or later
 
 Pasarela CyberSource REST con Payer Authentication 3-D Secure, device fingerprint,
@@ -84,6 +86,11 @@ paquete ni deben utilizarse en Produccion.
 * TARJETAS DE PRUEBA 3DS 1.xlsx
 
 == Changelog ==
+
+= 1.1.4 =
+* Autoria del plugin actualizada a www.soydiaz.com.
+* El codigo de seguridad ahora se identifica como CVV en checkout clasico y Blocks (campo cybs_card_cvv; se sigue aceptando cybs_card_cvc por compatibilidad).
+* El CVV se captura enmascarado: los digitos no se muestran mientras se escriben.
 
 = 1.1.3 =
 * Acepta promociones explicitas devueltas por CyberSource y registra el descuento en el pedido para que el total coincida con el importe cobrado.

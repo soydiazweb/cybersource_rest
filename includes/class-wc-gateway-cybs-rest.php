@@ -129,7 +129,7 @@ class WC_Gateway_Cybs_REST extends WC_Payment_Gateway {
 		<fieldset id="wc-<?php echo esc_attr( $this->id ); ?>-cc-form" class="wc-credit-card-form wc-payment-form">
 			<p class="form-row form-row-wide"><label for="cybs-card-number"><?php esc_html_e( 'Numero de tarjeta', 'cybersource-rest-woocommerce' ); ?> <span class="required">*</span></label><input id="cybs-card-number" name="cybs_card_number" class="input-text" inputmode="numeric" autocomplete="cc-number" maxlength="23" placeholder="•••• •••• •••• ••••" /></p>
 			<p class="form-row form-row-first"><label for="cybs-card-expiry"><?php esc_html_e( 'Vencimiento', 'cybersource-rest-woocommerce' ); ?> <span class="required">*</span></label><input id="cybs-card-expiry" name="cybs_card_expiry" class="input-text" type="text" inputmode="numeric" autocomplete="cc-exp" maxlength="7" pattern="[0-9 /]*" placeholder="MM / AA" aria-describedby="cybs-card-expiry-help" /><small id="cybs-card-expiry-help"><?php esc_html_e( 'Ejemplo: 01 / 29', 'cybersource-rest-woocommerce' ); ?></small></p>
-			<p class="form-row form-row-last"><label for="cybs-card-cvc"><?php esc_html_e( 'Codigo de seguridad', 'cybersource-rest-woocommerce' ); ?> <span class="required">*</span></label><input id="cybs-card-cvc" name="cybs_card_cvc" class="input-text" inputmode="numeric" autocomplete="cc-csc" maxlength="4" placeholder="CVC" /></p>
+			<p class="form-row form-row-last"><label for="cybs-card-cvv"><?php esc_html_e( 'CVV', 'cybersource-rest-woocommerce' ); ?> <span class="required">*</span></label><input id="cybs-card-cvv" name="cybs_card_cvv" class="input-text cybs-card-cvv" type="password" inputmode="numeric" autocomplete="cc-csc" maxlength="4" placeholder="&bull;&bull;&bull;&bull;" aria-describedby="cybs-card-cvv-help" /><small id="cybs-card-cvv-help"><?php esc_html_e( 'Se oculta mientras lo escribes.', 'cybersource-rest-woocommerce' ); ?></small></p>
 			<input type="hidden" name="cybs_auth_token" id="cybs-auth-token" value="" />
 			<input type="hidden" name="cybs_checkout_binding" id="cybs-checkout-binding" value="<?php echo esc_attr( $this->checkout_binding() ); ?>" />
 			<input type="hidden" name="cybs_device_fingerprint_id" id="cybs-device-fingerprint-id" value="<?php echo esc_attr( $this->device_fingerprint_id() ); ?>" />
@@ -452,7 +452,8 @@ class WC_Gateway_Cybs_REST extends WC_Payment_Gateway {
 	private function posted_card() {
 		$number = isset( $_POST['cybs_card_number'] ) ? preg_replace( '/\D+/', '', wc_clean( wp_unslash( $_POST['cybs_card_number'] ) ) ) : ''; // phpcs:ignore WordPress.Security.NonceVerification.Missing
 		$expiry = isset( $_POST['cybs_card_expiry'] ) ? preg_replace( '/\D+/', '', wc_clean( wp_unslash( $_POST['cybs_card_expiry'] ) ) ) : ''; // phpcs:ignore WordPress.Security.NonceVerification.Missing
-		$cvc    = isset( $_POST['cybs_card_cvc'] ) ? preg_replace( '/\D+/', '', wc_clean( wp_unslash( $_POST['cybs_card_cvc'] ) ) ) : ''; // phpcs:ignore WordPress.Security.NonceVerification.Missing
+		$cvv_in = isset( $_POST['cybs_card_cvv'] ) ? $_POST['cybs_card_cvv'] : ( isset( $_POST['cybs_card_cvc'] ) ? $_POST['cybs_card_cvc'] : '' ); // phpcs:ignore WordPress.Security.NonceVerification.Missing
+		$cvv    = preg_replace( '/\D+/', '', wc_clean( wp_unslash( $cvv_in ) ) );
 		if ( ! in_array( strlen( $expiry ), array( 4, 6 ), true ) ) {
 			return new WP_Error( 'cybs_expiry', __( 'Fecha de vencimiento no valida.', 'cybersource-rest-woocommerce' ) );
 		}
@@ -464,10 +465,10 @@ class WC_Gateway_Cybs_REST extends WC_Payment_Gateway {
 		if ( (int) $month < 1 || (int) $month > 12 || strlen( $year ) !== 4 || ( (int) $year * 100 + (int) $month ) < ( (int) gmdate( 'Y' ) * 100 + (int) gmdate( 'm' ) ) ) {
 			return new WP_Error( 'cybs_expiry', __( 'La tarjeta esta vencida o la fecha no es valida.', 'cybersource-rest-woocommerce' ) );
 		}
-		if ( strlen( $cvc ) < 3 || strlen( $cvc ) > 4 ) {
-			return new WP_Error( 'cybs_cvc', __( 'Codigo de seguridad no valido.', 'cybersource-rest-woocommerce' ) );
+		if ( strlen( $cvv ) < 3 || strlen( $cvv ) > 4 ) {
+			return new WP_Error( 'cybs_cvv', __( 'CVV no valido.', 'cybersource-rest-woocommerce' ) );
 		}
-		return array( 'number' => $number, 'expirationMonth' => $month, 'expirationYear' => $year, 'securityCode' => $cvc, 'type' => self::card_type( $number ) );
+		return array( 'number' => $number, 'expirationMonth' => $month, 'expirationYear' => $year, 'securityCode' => $cvv, 'type' => self::card_type( $number ) );
 	}
 
 	public static function luhn_valid( $number ) {
