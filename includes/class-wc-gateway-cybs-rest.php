@@ -10,6 +10,9 @@ class WC_Gateway_Cybs_REST extends WC_Payment_Gateway {
 	private $logger;
 	private static $request_device_fingerprint_id = '';
 
+	/** Estados que impiden un nuevo cobro del mismo pedido (cobrado, en revision o indeterminado). */
+	const LOCKED_STATUSES = array( 'ACCEPTED', 'AUTHORIZED', 'AUTHORIZED_PENDING_REVIEW', 'PENDING_REVIEW', 'CAPTURED', 'PENDING', 'TRANSMITTED', 'SENDING', 'UNKNOWN' );
+
 	public function __construct() {
 		$this->id                 = 'cybersource_rest';
 		$this->method_title       = __( 'CyberSource REST', 'cybersource-rest-woocommerce' );
@@ -26,6 +29,10 @@ class WC_Gateway_Cybs_REST extends WC_Payment_Gateway {
 		$this->enabled      = $this->get_option( 'enabled', 'no' );
 		$this->environment  = $this->get_option( 'environment', 'test' );
 		$this->enable_3ds   = $this->get_option( 'enable_3ds', 'yes' );
+		// En Produccion 3-D Secure es obligatorio: ninguna autorizacion sale sin autenticacion.
+		if ( 'production' === $this->environment ) {
+			$this->enable_3ds = 'yes';
+		}
 		$this->capture      = $this->get_option( 'capture', 'yes' );
 		$this->logging      = $this->get_option( 'logging', 'yes' );
 		$this->logger       = new WC_Cybs_REST_Logger( $this->logging );
@@ -89,6 +96,7 @@ class WC_Gateway_Cybs_REST extends WC_Payment_Gateway {
 				'type'    => 'checkbox',
 				'label'   => __( 'Exigir 3-D Secure antes de autorizar', 'cybersource-rest-woocommerce' ),
 				'default' => 'yes',
+				'description' => __( 'Solo puede desactivarse en Desarrollo / pruebas. En Produccion siempre se exige.', 'cybersource-rest-woocommerce' ),
 			),
 			'capture' => array(
 				'title'   => __( 'Captura', 'cybersource-rest-woocommerce' ),
@@ -109,6 +117,9 @@ class WC_Gateway_Cybs_REST extends WC_Payment_Gateway {
 	public function admin_options() {
 		parent::admin_options();
 		echo '<div class="notice notice-warning inline"><p><strong>' . esc_html__( 'Seguridad:', 'cybersource-rest-woocommerce' ) . '</strong> ' . esc_html__( 'Esta integracion directa requiere HTTPS y un entorno con cumplimiento PCI DSS. HTTP Signature continua disponible, pero CyberSource anuncia su retiro para marzo de 2027; planifique la migracion a JWT con MLE.', 'cybersource-rest-woocommerce' ) . '</p></div>';
+		if ( 'production' === $this->get_option( 'environment' ) && 'yes' !== $this->get_option( 'enable_3ds' ) ) {
+			echo '<div class="notice notice-info inline"><p>' . esc_html__( 'El ambiente activo es Produccion: 3-D Secure se exige aunque la casilla este desmarcada.', 'cybersource-rest-woocommerce' ) . '</p></div>';
+		}
 	}
 
 	public function is_available() {
@@ -160,11 +171,27 @@ class WC_Gateway_Cybs_REST extends WC_Payment_Gateway {
 			return array( 'result' => 'failure' );
 		}
 
-		$existing_transaction_id = $order->get_transaction_id() ?: $order->get_meta( '_cybs_request_id' );
-		$existing_status         = strtoupper( (string) $order->get_meta( '_cybs_status' ) );
-		$locked_statuses         = array( 'ACCEPTED', 'AUTHORIZED', 'AUTHORIZED_PENDING_REVIEW', 'CAPTURED', 'PENDING', 'TRANSMITTED' );
-		if ( $existing_transaction_id && in_array( $existing_status, $locked_statuses, true ) ) {
-			$order->add_order_note( __( 'CyberSource: se evito un reintento porque la orden ya tiene un identificador de transaccion.', 'cybersource-rest-woocommerce' ) );
+		// Un solo cobro a la vez por pedido (doble clic, dos pestanas o reintentos simultaneos).
+		if ( ! $this->acquire_order_lock( $order->get_id() ) ) {
+			unset( $card );
+			wc_add_notice( __( 'Ya hay un pago en proceso para este pedido. Espera unos segundos y revisa tu correo antes de volver a intentarlo.', 'cybersource-rest-woocommerce' ), 'error' );
+			return array( 'result' => 'failure' );
+		}
+		try {
+			return $this->process_locked_payment( $order->get_id(), $card );
+		} finally {
+			unset( $card );
+			$this->release_order_lock( $order->get_id() );
+		}
+	}
+
+	private function process_locked_payment( $order_id, array $card ) {
+		$order = wc_get_order( $order_id );
+
+		// Se relee el estado directamente de la base de datos dentro del lock para decidir sobre datos consistentes.
+		$existing_status = strtoupper( $this->fresh_order_meta( $order_id, '_cybs_status' ) );
+		if ( in_array( $existing_status, self::LOCKED_STATUSES, true ) ) {
+			$order->add_order_note( sprintf( __( 'CyberSource: se evito un reintento porque la orden ya tiene un cobro en estado %s.', 'cybersource-rest-woocommerce' ), $existing_status ) );
 			wc_add_notice( __( 'Este pedido ya fue enviado a CyberSource y esta pendiente de confirmacion. No vuelvas a intentar el cobro.', 'cybersource-rest-woocommerce' ), 'notice' );
 			WC()->cart->empty_cart();
 			return array( 'result' => 'success', 'redirect' => $this->get_return_url( $order ) );
@@ -176,91 +203,389 @@ class WC_Gateway_Cybs_REST extends WC_Payment_Gateway {
 			return array( 'result' => 'failure' );
 		}
 
-		$correlation_id = 'order-' . $order->get_id() . '-' . wp_generate_uuid4();
-		$payload        = $this->build_payment_payload( $order, $card, $auth );
+		$payload = $this->build_payment_payload( $order, $card, $auth );
 		if ( is_wp_error( $payload ) ) {
-			unset( $card );
 			$order->add_order_note( sprintf( __( 'CyberSource no recibio el pago: %s', 'cybersource-rest-woocommerce' ), $payload->get_error_message() ) );
 			wc_add_notice( $payload->get_error_message(), 'error' );
 			return array( 'result' => 'failure' );
 		}
+
+		// Referencia unica por intento: permite encontrar el cobro en CyberSource si se pierde la respuesta.
+		$reference = $this->start_attempt( $order );
+		$payload['clientReferenceInformation']['code'] = $reference;
+		$correlation_id = 'order-' . $order->get_id() . '-' . wp_generate_uuid4();
 		$response       = $this->client()->request( 'POST', '/pts/v2/payments', $payload, $correlation_id );
-		unset( $card, $payload );
+		unset( $payload );
 
 		if ( is_wp_error( $response ) ) {
-			$error_data   = $response->get_error_data();
-			$api_response = is_array( $error_data ) && is_array( $error_data['response'] ?? null ) ? $error_data['response'] : array();
-			if ( $api_response ) {
-				$this->record_transaction_details( $order, $api_response, $auth );
-			}
-			$order->add_order_note( sprintf( __( 'CyberSource rechazo el pago: %s', 'cybersource-rest-woocommerce' ), $response->get_error_message() ) );
-			wc_add_notice( __( 'No fue posible autorizar el pago. Verifica los datos o utiliza otra tarjeta.', 'cybersource-rest-woocommerce' ), 'error' );
-			return array( 'result' => 'failure' );
+			$error_data  = $response->get_error_data();
+			$http_status = is_array( $error_data ) ? (int) ( $error_data['status'] ?? 0 ) : 0;
+			$body        = is_array( $error_data ) && is_array( $error_data['response'] ?? null ) ? $error_data['response'] : array();
+		} else {
+			$http_status = 201;
+			$body        = $response;
+		}
+		$status  = strtoupper( (string) ( $body['status'] ?? '' ) );
+		$outcome = WC_Cybs_REST_Outcome::classify( $status, $http_status, $body );
+		if ( WC_Cybs_REST_Outcome::PAID === $outcome && '' === (string) ( $body['id'] ?? '' ) ) {
+			$outcome = WC_Cybs_REST_Outcome::UNKNOWN;
+		}
+		return $this->handle_payment_outcome( $order, $outcome, $status, $body, $auth, $http_status );
+	}
+
+	private function handle_payment_outcome( WC_Order $order, $outcome, $status, array $body, array $auth, $http_status ) {
+		$transaction_id = sanitize_text_field( (string) ( $body['id'] ?? '' ) );
+		if ( $body ) {
+			$this->record_transaction_details( $order, $body, $auth );
 		}
 
-		$status          = strtoupper( (string) ( $response['status'] ?? '' ) );
-		$transaction_id = sanitize_text_field( (string) ( $response['id'] ?? '' ) );
-		$this->record_transaction_details( $order, $response, $auth );
-		if ( '' === $transaction_id ) {
-			$order->add_order_note( sprintf( __( 'Respuesta CyberSource no aprobada. Estado: %s', 'cybersource-rest-woocommerce' ), $status ?: 'UNKNOWN' ) );
-			wc_add_notice( __( 'La tarjeta no fue aprobada. Utiliza otra forma de pago.', 'cybersource-rest-woocommerce' ), 'error' );
-			return array( 'result' => 'failure' );
-		}
-
-		$paid_statuses    = array( 'ACCEPTED', 'AUTHORIZED', 'CAPTURED', 'TRANSMITTED' );
-		$pending_statuses = array( 'AUTHORIZED_PENDING_REVIEW', 'PENDING' );
-		$is_paid_status   = in_array( $status, $paid_statuses, true );
-		$is_pending       = in_array( $status, $pending_statuses, true );
-		$is_accepted      = 'ACCEPTED' === $status && $this->processor_approved( $response );
-		if ( ! $is_paid_status && ! $is_pending && $this->processor_approved( $response ) ) {
-			$is_pending = true;
-		}
-
-		if ( $is_paid_status && 'ACCEPTED' === $status && ! $is_accepted ) {
-			$is_paid_status = false;
-			$is_pending     = true;
-		}
-
-		if ( $is_paid_status || $is_pending ) {
-			$amount_check = $this->validate_response_amount( $order, $response );
-			if ( is_wp_error( $amount_check ) ) {
-				$promotion = $this->apply_cybersource_promotion( $order, $response );
-				if ( true === $promotion ) {
-					$amount_check = $this->validate_response_amount( $order, $response );
+		if ( in_array( $outcome, array( WC_Cybs_REST_Outcome::PAID, WC_Cybs_REST_Outcome::REVIEW ), true ) ) {
+			$amount_check = $this->validate_response_amount( $order, $body );
+			if ( is_wp_error( $amount_check ) && WC_Cybs_REST_Outcome::PAID === $outcome ) {
+				if ( true === $this->apply_cybersource_promotion( $order, $body ) ) {
+					$amount_check = $this->validate_response_amount( $order, $body );
 				}
 			}
-			if ( is_wp_error( $amount_check ) ) {
-				$void = $this->void_mismatched_payment( $order, $transaction_id );
-				if ( is_wp_error( $void ) ) {
-					$order->update_status( 'on-hold', sprintf( __( 'CyberSource requiere revision manual: %1$s No se pudo confirmar automaticamente la anulacion.', 'cybersource-rest-woocommerce' ), $amount_check->get_error_message() ) );
-					wc_add_notice( __( 'CyberSource recibio el pago, pero no fue posible confirmar su anulacion. No vuelvas a intentarlo; revisaremos el pedido.', 'cybersource-rest-woocommerce' ), 'notice' );
-					WC()->cart->empty_cart();
-					return array( 'result' => 'success', 'redirect' => $this->get_return_url( $order ) );
-				}
-				$order->update_status( 'failed', sprintf( __( 'CyberSource anulo el pago por diferencia de importe: %s', 'cybersource-rest-woocommerce' ), $amount_check->get_error_message() ) );
-				wc_add_notice( __( 'El pago fue anulado porque el importe no coincidio con el pedido. No se realizo el cobro; puedes intentarlo nuevamente.', 'cybersource-rest-woocommerce' ), 'error' );
+			// En revision solo se libera ante una diferencia explicita; si la respuesta no trae importe, decide la reconciliacion.
+			$release_for_amount = is_wp_error( $amount_check ) && ( WC_Cybs_REST_Outcome::PAID === $outcome || 'cybs_response_amount_mismatch' === $amount_check->get_error_code() );
+			if ( $release_for_amount ) {
+				return $this->release_and_respond( $order, $transaction_id, $body, sprintf( __( 'Diferencia de importe: %s', 'cybersource-rest-woocommerce' ), $amount_check->get_error_message() ), __( 'El pago fue anulado porque el importe no coincidio con el pedido. No se realizo el cobro; puedes intentarlo nuevamente.', 'cybersource-rest-woocommerce' ) );
+			}
+		}
+
+		switch ( $outcome ) {
+			case WC_Cybs_REST_Outcome::PAID:
+				$this->finish_reconcile( $order );
+				$order->payment_complete( $transaction_id );
+				$order->add_order_note( sprintf( __( 'Pago CyberSource aprobado. ID: %1$s. Estado: %2$s.', 'cybersource-rest-woocommerce' ), $transaction_id, $status ) );
+				WC()->cart->empty_cart();
+				return array( 'result' => 'success', 'redirect' => $this->get_return_url( $order ) );
+
+			case WC_Cybs_REST_Outcome::REVIEW:
+				$order->update_meta_data( '_cybs_status', $status );
+				$order->update_meta_data( '_cybs_reconcile', 'yes' );
+				$order->save();
+				$order->update_status( 'on-hold', sprintf( __( 'CyberSource dejo la transaccion pendiente de revision (%s). Se consultara automaticamente su resultado.', 'cybersource-rest-woocommerce' ), $status ) );
+				wc_add_notice( __( 'El pago fue recibido y esta pendiente de confirmacion. No vuelvas a intentarlo.', 'cybersource-rest-woocommerce' ), 'notice' );
+				WC()->cart->empty_cart();
+				return array( 'result' => 'success', 'redirect' => $this->get_return_url( $order ) );
+
+			case WC_Cybs_REST_Outcome::RELEASE:
+				$reason = 'PARTIAL_AUTHORIZED' === $status ? __( 'Aprobacion parcial no aceptada', 'cybersource-rest-woocommerce' ) : __( 'Aprobado por el banco y rechazado por gestion de riesgo', 'cybersource-rest-woocommerce' );
+				return $this->release_and_respond( $order, $transaction_id, $body, $reason, WC_Cybs_REST_Outcome::friendly_message( $outcome, $body, $status ) . ' ' . __( 'La retencion que pudo aparecer en tu tarjeta ya se libero.', 'cybersource-rest-woocommerce' ) );
+
+			case WC_Cybs_REST_Outcome::DECLINED:
+			case WC_Cybs_REST_Outcome::ERROR:
+				$order->update_meta_data( '_cybs_status', $status ?: 'ERROR' );
+				$this->finish_reconcile( $order );
+				$reason = WC_Cybs_REST_Outcome::reason( $body );
+				$order->add_order_note( sprintf( __( 'CyberSource rechazo el pago. Estado: %1$s. Motivo: %2$s. HTTP %3$d.', 'cybersource-rest-woocommerce' ), $status ?: 'N/D', $reason ?: 'N/D', $http_status ) );
+				wc_add_notice( WC_Cybs_REST_Outcome::friendly_message( $outcome, $body, $status ), 'error' );
 				return array( 'result' => 'failure' );
-			}
 		}
 
-		if ( $is_pending ) {
-			$order->update_status( 'on-hold', sprintf( __( 'CyberSource dejo la transaccion pendiente de revision. Estado: %s.', 'cybersource-rest-woocommerce' ), $status ) );
-			wc_add_notice( __( 'El pago fue recibido y esta pendiente de confirmacion. No vuelvas a intentarlo.', 'cybersource-rest-woocommerce' ), 'notice' );
+		// Indeterminado (timeout, error 5xx o estado no reconocido): no se permite reintentar; se reconcilia.
+		$order->update_meta_data( '_cybs_status', 'UNKNOWN' );
+		$order->update_meta_data( '_cybs_reconcile', 'yes' );
+		$order->save();
+		$order->update_status(
+			'on-hold',
+			sprintf(
+				__( 'CyberSource: resultado indeterminado (HTTP %1$d, estado %2$s). Se reconciliara automaticamente con la referencia %3$s; no reintentar el cobro.', 'cybersource-rest-woocommerce' ),
+				$http_status,
+				$status ?: 'N/D',
+				(string) $order->get_meta( '_cybs_attempt_reference' )
+			)
+		);
+		wc_add_notice( WC_Cybs_REST_Outcome::friendly_message( WC_Cybs_REST_Outcome::UNKNOWN ), 'notice' );
+		WC()->cart->empty_cart();
+		return array( 'result' => 'success', 'redirect' => $this->get_return_url( $order ) );
+	}
+
+	/** Libera la autorizacion y responde al checkout segun si la liberacion se confirmo. */
+	private function release_and_respond( WC_Order $order, $transaction_id, array $body, $reason, $customer_message ) {
+		$this->finish_reconcile( $order );
+		$release = $this->release_authorization( $order, $transaction_id, $body, $reason );
+		if ( is_wp_error( $release ) ) {
+			$order->update_status( 'on-hold', sprintf( __( 'CyberSource requiere revision manual: %1$s. No se pudo liberar automaticamente la autorizacion %2$s; anularla en Business Center.', 'cybersource-rest-woocommerce' ), $reason, $transaction_id ?: 'N/D' ) );
+			wc_add_notice( __( 'El pago no se completo y estamos liberando la retencion de tu tarjeta. No vuelvas a intentarlo; revisaremos el pedido.', 'cybersource-rest-woocommerce' ), 'notice' );
 			WC()->cart->empty_cart();
 			return array( 'result' => 'success', 'redirect' => $this->get_return_url( $order ) );
 		}
+		$order->update_status( 'failed', sprintf( __( 'CyberSource: cobro no completado y autorizacion liberada. %s', 'cybersource-rest-woocommerce' ), $reason ) );
+		wc_add_notice( $customer_message, 'error' );
+		return array( 'result' => 'failure' );
+	}
 
-		if ( ! $is_paid_status ) {
-			$order->add_order_note( sprintf( __( 'Respuesta CyberSource no aprobada. Estado: %s', 'cybersource-rest-woocommerce' ), $status ?: 'UNKNOWN' ) );
-			wc_add_notice( __( 'La tarjeta no fue aprobada. Utiliza otra forma de pago.', 'cybersource-rest-woocommerce' ), 'error' );
-			return array( 'result' => 'failure' );
+	/**
+	 * Libera una autorizacion que no debe quedar: primero reversa
+	 * (/reversals) y, si falla (p. ej. ya se capturo), void (/voids).
+	 */
+	public function release_authorization( WC_Order $order, $transaction_id, array $body, $reason ) {
+		if ( ! $transaction_id ) {
+			$order->add_order_note( __( 'CyberSource: falta el ID de la transaccion que debe liberarse.', 'cybersource-rest-woocommerce' ) );
+			return new WP_Error( 'cybs_release_missing_transaction', __( 'Falta el ID de la transaccion que debe liberarse.', 'cybersource-rest-woocommerce' ) );
+		}
+		$client    = $this->client_for_environment( $order->get_meta( '_cybs_environment' ) ?: $this->environment );
+		$details   = is_array( $body['orderInformation']['amountDetails'] ?? null ) ? $body['orderInformation']['amountDetails'] : array();
+		$amount    = (string) ( $details['authorizedAmount'] ?? $details['totalAmount'] ?? '' );
+		$currency  = (string) ( $details['currency'] ?? $order->get_currency() );
+		$reference = array( 'code' => 'release-' . $order->get_id() );
+		$path      = '/pts/v2/payments/' . rawurlencode( $transaction_id );
+		$type      = '';
+		$response  = null;
+
+		if ( '' !== $amount ) {
+			$response = $client->request(
+				'POST',
+				$path . '/reversals',
+				array(
+					'clientReferenceInformation' => $reference,
+					'reversalInformation'        => array( 'amountDetails' => array( 'totalAmount' => $amount, 'currency' => $currency ) ),
+				),
+				'reversal-order-' . $order->get_id()
+			);
+			if ( ! is_wp_error( $response ) && in_array( strtoupper( (string) ( $response['status'] ?? '' ) ), array( 'REVERSED', '' ), true ) ) {
+				$type = 'REVERSED';
+			}
+		}
+		if ( '' === $type ) {
+			$response = $client->request( 'POST', $path . '/voids', array( 'clientReferenceInformation' => $reference ), 'void-order-' . $order->get_id() );
+			if ( ! is_wp_error( $response ) && in_array( strtoupper( (string) ( $response['status'] ?? '' ) ), array( 'VOIDED', 'REVERSED' ), true ) ) {
+				$type = 'VOIDED';
+			}
+		}
+		if ( '' === $type ) {
+			$order->update_meta_data( '_cybs_release_type', 'FAILED' );
+			$order->save();
+			$order->add_order_note( sprintf( __( 'CyberSource: NO se pudo liberar la autorizacion %1$s (%2$s). Revisar y anular en Business Center.', 'cybersource-rest-woocommerce' ), $transaction_id, $reason ) );
+			return new WP_Error( 'cybs_release_failed', __( 'No se pudo liberar la autorizacion.', 'cybersource-rest-woocommerce' ) );
 		}
 
-		$order->payment_complete( $transaction_id );
-		$order->add_order_note( sprintf( __( 'Pago CyberSource aprobado. ID: %1$s. Estado: %2$s.', 'cybersource-rest-woocommerce' ), $transaction_id, $status ) );
-		WC()->cart->empty_cart();
+		$release_id     = sanitize_text_field( (string) ( $response['id'] ?? '' ) );
+		$release_status = sanitize_text_field( (string) ( $response['status'] ?? $type ) );
+		$original       = sanitize_text_field( (string) $order->get_meta( '_cybs_status' ) );
+		if ( $original && ! in_array( strtoupper( $original ), array( 'REVERSED', 'VOIDED' ), true ) ) {
+			$order->update_meta_data( '_cybs_original_status', $original );
+		}
+		$order->update_meta_data( '_cybs_release_type', $type );
+		$order->update_meta_data( '_cybs_release_id', $release_id );
+		$order->update_meta_data( '_cybs_release_status', $release_status );
+		if ( 'VOIDED' === $type ) {
+			$order->update_meta_data( '_cybs_void_id', $release_id );
+			$order->update_meta_data( '_cybs_void_status', $release_status );
+		}
+		$order->update_meta_data( '_cybs_status', $type );
+		$order->save();
+		$order->add_order_note( sprintf( __( 'CyberSource: autorizacion %1$s liberada con %2$s. ID: %3$s. Importe: %4$s %5$s. Motivo: %6$s.', 'cybersource-rest-woocommerce' ), $transaction_id, 'REVERSED' === $type ? 'reversa' : 'void', $release_id ?: 'N/D', $amount ?: 'N/D', $currency, $reason ) );
+		return true;
+	}
 
-		return array( 'result' => 'success', 'redirect' => $this->get_return_url( $order ) );
+	/**
+	 * Consulta en CyberSource el estado real de un cobro indeterminado o en revision y
+	 * actualiza el pedido SIN volver a cobrar. Lo ejecuta el cron cada 15 minutos y la
+	 * accion manual del pedido.
+	 *
+	 * @return string Resultado corto para registro.
+	 */
+	public function reconcile_order( WC_Order $order, $manual = false ) {
+		if ( 'yes' !== $order->get_meta( '_cybs_reconcile' ) && ! $manual ) {
+			return 'skip';
+		}
+		$since = (int) $order->get_meta( '_cybs_reconcile_since' );
+		$age   = $since ? time() - $since : DAY_IN_SECONDS;
+		if ( ! $manual && $age < 5 * MINUTE_IN_SECONDS ) {
+			return 'too_early';
+		}
+		$client     = $this->client_for_environment( $order->get_meta( '_cybs_environment' ) ?: $this->environment );
+		$request_id = (string) $order->get_meta( '_cybs_request_id' );
+		$reference  = (string) $order->get_meta( '_cybs_attempt_reference' );
+
+		if ( '' === $request_id && '' !== $reference ) {
+			$request_id = $this->find_request_id_by_reference( $client, $reference, $order->get_id() );
+			if ( is_wp_error( $request_id ) ) {
+				if ( $manual ) {
+					$order->add_order_note( sprintf( __( 'CyberSource: no se pudo consultar la referencia %1$s: %2$s', 'cybersource-rest-woocommerce' ), $reference, $request_id->get_error_message() ) );
+				}
+				return 'error';
+			}
+		}
+
+		if ( '' === $request_id ) {
+			if ( $age >= 2 * HOUR_IN_SECONDS ) {
+				$order->update_meta_data( '_cybs_status', 'NOT_FOUND' );
+				$this->finish_reconcile( $order );
+				$note = sprintf( __( 'CyberSource no registra ningun cobro con la referencia %s despues de 2 horas: no se realizo cargo. El cliente puede volver a intentar el pago.', 'cybersource-rest-woocommerce' ), $reference ?: 'N/D' );
+				if ( $order->has_status( array( 'on-hold', 'pending' ) ) ) {
+					$order->update_status( 'failed', $note );
+				} else {
+					$order->add_order_note( $note );
+				}
+				return 'not_found';
+			}
+			if ( $manual ) {
+				$order->add_order_note( sprintf( __( 'CyberSource todavia no muestra la referencia %s; se volvera a consultar automaticamente.', 'cybersource-rest-woocommerce' ), $reference ?: 'N/D' ) );
+			}
+			return 'pending';
+		}
+
+		$detail = $client->request( 'GET', '/tss/v2/transactions/' . rawurlencode( $request_id ), array(), 'reconcile-order-' . $order->get_id() );
+		if ( is_wp_error( $detail ) ) {
+			if ( $manual ) {
+				$order->add_order_note( sprintf( __( 'CyberSource: no se pudo consultar la transaccion %1$s: %2$s', 'cybersource-rest-woocommerce' ), $request_id, $detail->get_error_message() ) );
+			}
+			return 'error';
+		}
+
+		$outcome    = WC_Cybs_REST_Outcome::classify_transaction_detail( $detail );
+		$app        = is_array( $detail['applicationInformation'] ?? null ) ? $detail['applicationInformation'] : array();
+		$app_status = strtoupper( sanitize_text_field( (string) ( $app['status'] ?? '' ) ) );
+		$reason     = sanitize_text_field( (string) ( $app['reasonCode'] ?? '' ) );
+		$order->update_meta_data( '_cybs_request_id', $request_id );
+		$order->save();
+
+		switch ( $outcome ) {
+			case WC_Cybs_REST_Outcome::PAID:
+				$amount_check = $this->validate_response_amount( $order, $detail );
+				if ( is_wp_error( $amount_check ) && 'cybs_response_amount_mismatch' !== $amount_check->get_error_code() ) {
+					// Aprobado pero sin importe verificable en el detalle: no se completa ni se anula automaticamente.
+					$order->update_meta_data( '_cybs_reconcile', 'manual' );
+					$order->save();
+					$order->add_order_note( sprintf( __( 'CyberSource reconciliado: la transaccion %s figura APROBADA pero sin importe verificable. Confirmar en Business Center antes de completar el pedido.', 'cybersource-rest-woocommerce' ), $request_id ) );
+					return 'manual';
+				}
+				if ( is_wp_error( $amount_check ) ) {
+					$this->finish_reconcile( $order );
+					$release = $this->release_authorization( $order, $request_id, $detail, sprintf( __( 'Diferencia de importe en reconciliacion: %s', 'cybersource-rest-woocommerce' ), $amount_check->get_error_message() ) );
+					$order->update_status( is_wp_error( $release ) ? 'on-hold' : 'failed', __( 'CyberSource: reconciliacion con importe distinto al pedido.', 'cybersource-rest-woocommerce' ) );
+					return 'amount_mismatch';
+				}
+				$order->update_meta_data( '_cybs_status', $app_status ?: 'AUTHORIZED' );
+				$order->set_transaction_id( $request_id );
+				$this->finish_reconcile( $order );
+				$order->add_order_note( sprintf( __( 'CyberSource reconciliado: cobro APROBADO. Request ID: %1$s. Estado: %2$s. Reason code: %3$s.', 'cybersource-rest-woocommerce' ), $request_id, $app_status ?: 'N/D', $reason ?: 'N/D' ) );
+				if ( $order->needs_payment() || $order->has_status( array( 'on-hold', 'pending', 'failed' ) ) ) {
+					$order->payment_complete( $request_id );
+				}
+				return 'paid';
+
+			case WC_Cybs_REST_Outcome::DECLINED:
+			case WC_Cybs_REST_Outcome::ERROR:
+				$order->update_meta_data( '_cybs_status', $app_status ?: 'DECLINED' );
+				$this->finish_reconcile( $order );
+				$order->update_status( 'failed', sprintf( __( 'CyberSource reconciliado: cobro RECHAZADO. Request ID: %1$s. Estado: %2$s. Reason code: %3$s. No hubo cargo.', 'cybersource-rest-woocommerce' ), $request_id, $app_status ?: 'N/D', $reason ?: 'N/D' ) );
+				return 'declined';
+
+			case WC_Cybs_REST_Outcome::RELEASE:
+				$this->finish_reconcile( $order );
+				$release = $this->release_authorization( $order, $request_id, $detail, __( 'Reconciliacion: aprobado por el banco y rechazado por gestion de riesgo', 'cybersource-rest-woocommerce' ) );
+				$order->update_status( is_wp_error( $release ) ? 'on-hold' : 'failed', __( 'CyberSource reconciliado: cobro no completado.', 'cybersource-rest-woocommerce' ) );
+				return 'released';
+		}
+
+		// Sigue en revision o indeterminado.
+		if ( $age >= 7 * DAY_IN_SECONDS ) {
+			$order->update_meta_data( '_cybs_reconcile', 'manual' );
+			$order->save();
+			$order->add_order_note( sprintf( __( 'CyberSource: la transaccion %1$s sigue sin resultado definitivo (%2$s) despues de 7 dias. Requiere revision manual en Business Center.', 'cybersource-rest-woocommerce' ), $request_id, $app_status ?: 'N/D' ) );
+			return 'manual';
+		}
+		if ( $manual ) {
+			$order->add_order_note( sprintf( __( 'CyberSource: la transaccion %1$s sigue pendiente (%2$s). Se volvera a consultar automaticamente.', 'cybersource-rest-woocommerce' ), $request_id, $app_status ?: 'N/D' ) );
+		}
+		return 'pending';
+	}
+
+	private function find_request_id_by_reference( WC_Cybs_REST_Client $client, $reference, $order_id ) {
+		if ( ! preg_match( '/^[A-Za-z0-9_-]{1,50}$/', $reference ) ) {
+			return '';
+		}
+		$response = $client->request(
+			'POST',
+			'/tss/v2/searches',
+			array(
+				'save'     => false,
+				'name'     => 'Conciliacion ' . $reference,
+				'timezone' => 'UTC',
+				'query'    => 'clientReferenceInformation.code:' . $reference,
+				'offset'   => 0,
+				'limit'    => 10,
+				'sort'     => 'id:asc, submitTimeUtc:desc',
+			),
+			'search-order-' . $order_id
+		);
+		if ( is_wp_error( $response ) ) {
+			return $response;
+		}
+		$summaries = $response['_embedded']['transactionSummaries'] ?? array();
+		$fallback  = '';
+		foreach ( (array) $summaries as $summary ) {
+			$code = (string) ( $summary['clientReferenceInformation']['code'] ?? '' );
+			$id   = sanitize_text_field( (string) ( $summary['id'] ?? '' ) );
+			if ( $code !== $reference || '' === $id ) {
+				continue;
+			}
+			foreach ( (array) ( $summary['applicationInformation']['applications'] ?? array() ) as $application ) {
+				if ( 'ics_auth' === ( $application['name'] ?? '' ) ) {
+					return $id;
+				}
+			}
+			if ( '' === $fallback ) {
+				$fallback = $id;
+			}
+		}
+		return $fallback;
+	}
+
+	/** Registra el inicio del intento antes de enviarlo: si la respuesta se pierde, el cron lo reconcilia. */
+	private function start_attempt( WC_Order $order ) {
+		$attempt   = (int) $order->get_meta( '_cybs_attempt' ) + 1;
+		$reference = substr( preg_replace( '/[^A-Za-z0-9_-]/', '', (string) $order->get_order_number() ), 0, 40 ) . '-' . $attempt;
+		$order->update_meta_data( '_cybs_attempt', $attempt );
+		$order->update_meta_data( '_cybs_attempt_reference', $reference );
+		$order->update_meta_data( '_cybs_environment', $this->environment );
+		$order->update_meta_data( '_cybs_status', 'SENDING' );
+		$order->update_meta_data( '_cybs_reconcile', 'yes' );
+		$order->update_meta_data( '_cybs_reconcile_since', time() );
+		$order->delete_meta_data( '_cybs_request_id' );
+		$order->save();
+		return $reference;
+	}
+
+	private function finish_reconcile( WC_Order $order ) {
+		$order->update_meta_data( '_cybs_reconcile', 'no' );
+		$order->save();
+	}
+
+	private function acquire_order_lock( $order_id ) {
+		global $wpdb;
+		$result = $wpdb->get_var( $wpdb->prepare( 'SELECT GET_LOCK(%s, 0)', $this->lock_name( $order_id ) ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery
+		if ( null === $result ) {
+			// El motor no soporta GET_LOCK: se continua (la verificacion de estado sigue activa).
+			$this->logger->log( 'warning', 'GET_LOCK no disponible; se procesa sin bloqueo', array( 'order_id' => $order_id ) );
+			return true;
+		}
+		return '1' === (string) $result;
+	}
+
+	private function release_order_lock( $order_id ) {
+		global $wpdb;
+		$wpdb->get_var( $wpdb->prepare( 'SELECT RELEASE_LOCK(%s)', $this->lock_name( $order_id ) ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery
+	}
+
+	private function lock_name( $order_id ) {
+		global $wpdb;
+		return 'cybs_' . substr( md5( DB_NAME . $wpdb->prefix ), 0, 12 ) . '_' . (int) $order_id;
+	}
+
+	/** Lee un metadato del pedido directo de la base de datos (sin cache de objetos). */
+	private function fresh_order_meta( $order_id, $key ) {
+		global $wpdb;
+		if ( class_exists( '\\Automattic\\WooCommerce\\Utilities\\OrderUtil' ) && \Automattic\WooCommerce\Utilities\OrderUtil::custom_orders_table_usage_is_enabled() ) {
+			$table = $wpdb->prefix . 'wc_orders_meta';
+			return (string) $wpdb->get_var( $wpdb->prepare( "SELECT meta_value FROM {$table} WHERE order_id = %d AND meta_key = %s ORDER BY id DESC LIMIT 1", $order_id, $key ) ); // phpcs:ignore
+		}
+		return (string) $wpdb->get_var( $wpdb->prepare( "SELECT meta_value FROM {$wpdb->postmeta} WHERE post_id = %d AND meta_key = %s ORDER BY meta_id DESC LIMIT 1", $order_id, $key ) ); // phpcs:ignore
 	}
 
 	public function process_refund( $order_id, $amount = null, $reason = '' ) {
@@ -285,36 +610,6 @@ class WC_Gateway_Cybs_REST extends WC_Payment_Gateway {
 		$refund_id = sanitize_text_field( (string) ( $response['id'] ?? '' ) );
 		$order->add_order_note( sprintf( __( 'Reembolso CyberSource solicitado. ID: %1$s. Motivo: %2$s', 'cybersource-rest-woocommerce' ), $refund_id ?: 'N/D', sanitize_text_field( $reason ) ) );
 		return true;
-	}
-
-	private function void_mismatched_payment( WC_Order $order, $transaction_id ) {
-		if ( ! $transaction_id ) {
-			return new WP_Error( 'cybs_void_missing_transaction', __( 'Falta el ID de la transaccion que debe anularse.', 'cybersource-rest-woocommerce' ) );
-		}
-		$response = $this->client()->request(
-			'POST',
-			'/pts/v2/payments/' . rawurlencode( $transaction_id ) . '/voids',
-			array( 'clientReferenceInformation' => array( 'code' => 'void-mismatch-' . $order->get_id() ) ),
-			'void-mismatch-order-' . $order->get_id()
-		);
-		if ( is_wp_error( $response ) ) {
-			$order->add_order_note( sprintf( __( 'CyberSource: fallo la anulacion automatica del importe incorrecto: %s', 'cybersource-rest-woocommerce' ), $response->get_error_message() ) );
-			return $response;
-		}
-		$void_id     = sanitize_text_field( (string) ( $response['id'] ?? '' ) );
-		$void_status = sanitize_text_field( (string) ( $response['status'] ?? '' ) );
-		$original_status = sanitize_text_field( (string) $order->get_meta( '_cybs_status' ) );
-		if ( $original_status ) {
-			$order->update_meta_data( '_cybs_original_status', $original_status );
-		}
-		$order->update_meta_data( '_cybs_void_id', $void_id );
-		$order->update_meta_data( '_cybs_void_status', $void_status );
-		if ( in_array( strtoupper( $void_status ), array( 'VOIDED', 'REVERSED' ), true ) ) {
-			$order->update_meta_data( '_cybs_status', strtoupper( $void_status ) );
-		}
-		$order->save();
-		$order->add_order_note( sprintf( __( 'CyberSource: anulacion automatica solicitada por diferencia de importe. Void ID: %1$s. Estado: %2$s.', 'cybersource-rest-woocommerce' ), $void_id ?: 'N/D', $void_status ?: 'N/D' ) );
-		return $response;
 	}
 
 	public function client() {
@@ -519,12 +814,10 @@ class WC_Gateway_Cybs_REST extends WC_Payment_Gateway {
 		if ( ! $valid ) {
 			return new WP_Error( 'cybs_auth_invalid', __( 'La autenticacion no corresponde a esta compra.', 'cybersource-rest-woocommerce' ) );
 		}
-		$eci = ltrim( (string) ( $data['eci'] ?? $data['eciRaw'] ?? '' ), '0' );
-		if ( '' === $eci ) $eci = '0';
-		if ( in_array( $eci, array( '0', '7' ), true ) ) {
-			return new WP_Error( 'cybs_eci_blocked', __( 'La autenticacion devolvio ECI 0 o 7; por seguridad no se envio la tarjeta a autorizar.', 'cybersource-rest-woocommerce' ) );
+		if ( ! WC_Cybs_REST_Outcome::eci_allows_authorization( $data['eciRaw'] ?? $data['eci'] ?? '' ) ) {
+			return new WP_Error( 'cybs_eci_blocked', __( 'Tu banco no pudo verificar la tarjeta con 3-D Secure. Por seguridad no se realizo el cobro; intenta con otra tarjeta.', 'cybersource-rest-woocommerce' ) );
 		}
-		if ( 'AUTHENTICATION_SUCCESSFUL' !== strtoupper( (string) ( $data['status'] ?? '' ) ) || ! in_array( strtoupper( (string) ( $data['paresStatus'] ?? '' ) ), array( 'Y', 'A', 'I' ), true ) ) {
+		if ( 'AUTHENTICATION_SUCCESSFUL' !== strtoupper( (string) ( $data['status'] ?? '' ) ) || in_array( strtoupper( (string) ( $data['paresStatus'] ?? '' ) ), array( 'N', 'R' ), true ) ) {
 			return new WP_Error( 'cybs_auth_failed', __( 'El banco no autentico la tarjeta. Utiliza otra forma de pago.', 'cybersource-rest-woocommerce' ) );
 		}
 		return $data;
@@ -555,7 +848,7 @@ class WC_Gateway_Cybs_REST extends WC_Payment_Gateway {
 			'clientReferenceInformation' => array( 'code' => (string) $order->get_order_number() ),
 			'processingInformation'      => array(
 				'capture'           => 'yes' === $this->capture,
-				'commerceIndicator' => $this->commerce_indicator( $card['type'], $auth ),
+				'commerceIndicator' => WC_Cybs_REST_Outcome::commerce_indicator( $card['type'], $auth, 'yes' === $this->enable_3ds ),
 				'authorizationOptions' => array( 'partialAuthIndicator' => false ),
 			),
 			'paymentInformation' => array( 'card' => $card ),
@@ -572,10 +865,6 @@ class WC_Gateway_Cybs_REST extends WC_Payment_Gateway {
 				'useRawFingerprintSessionId' => false,
 				'ipAddress'                  => WC_Geolocation::get_ip_address(),
 				'userAgent'                  => sanitize_text_field( wp_unslash( $_SERVER['HTTP_USER_AGENT'] ?? '' ) ),
-			),
-			// Compatibility field used by legacy Decision Manager/Visanet integrations.
-			'riskInformation' => array(
-				'deviceFingerprintId' => $device_fingerprint_id,
 			),
 		);
 		if ( 'yes' === $this->enable_3ds ) {
@@ -754,12 +1043,6 @@ class WC_Gateway_Cybs_REST extends WC_Payment_Gateway {
 		);
 	}
 
-	private function processor_approved( array $response ) {
-		$code     = trim( (string) ( $response['processorInformation']['responseCode'] ?? '' ) );
-		$approval = trim( (string) ( $response['processorInformation']['approvalCode'] ?? '' ) );
-		return '' !== $approval && in_array( $code, array( '0', '00', '000' ), true );
-	}
-
 	private function validate_response_amount( WC_Order $order, array $response ) {
 		$details  = $response['orderInformation']['amountDetails'] ?? array();
 		$amount   = $details['authorizedAmount'] ?? $details['totalAmount'] ?? null;
@@ -860,7 +1143,7 @@ class WC_Gateway_Cybs_REST extends WC_Payment_Gateway {
 			'_cybs_authorized_amount'               => sanitize_text_field( (string) ( $amount_details['authorizedAmount'] ?? $amount_details['totalAmount'] ?? '' ) ),
 			'_cybs_requested_amount'                => wc_format_decimal( $order->get_total(), wc_get_price_decimals() ),
 			'_cybs_currency'                        => sanitize_text_field( (string) ( $amount_details['currency'] ?? $order->get_currency() ) ),
-			'_cybs_client_reference_code'            => sanitize_text_field( (string) $order->get_order_number() ),
+			'_cybs_client_reference_code'            => sanitize_text_field( (string) ( $order->get_meta( '_cybs_attempt_reference' ) ?: $order->get_order_number() ) ),
 			'_cybs_device_fingerprint_id'           => $device_id,
 			'_cybs_eci'                             => sanitize_text_field( (string) ( $auth['eci'] ?? $auth['eciRaw'] ?? '' ) ),
 			'_cybs_pares_status'                    => sanitize_text_field( (string) ( $auth['paresStatus'] ?? '' ) ),
@@ -873,14 +1156,14 @@ class WC_Gateway_Cybs_REST extends WC_Payment_Gateway {
 			}
 		}
 		$tracked_statuses = array( 'ACCEPTED', 'AUTHORIZED', 'AUTHORIZED_PENDING_REVIEW', 'CAPTURED', 'PENDING', 'TRANSMITTED' );
-		if ( $request_id && ( in_array( strtoupper( $status ), $tracked_statuses, true ) || $this->processor_approved( $response ) ) ) {
+		if ( $request_id && ( in_array( strtoupper( $status ), $tracked_statuses, true ) || WC_Cybs_REST_Outcome::processor_approved( $response ) ) ) {
 			$order->set_transaction_id( $request_id );
 		}
 		$order->save();
 
 		$labels = array(
 			'Estado'                    => $status,
-			'Referencia WooCommerce'    => $meta['_cybs_client_reference_code'],
+			'Referencia del intento'    => $meta['_cybs_client_reference_code'],
 			'Request ID'                => $request_id,
 			'Network Transaction ID'    => $meta['_cybs_network_transaction_id'],
 			'Processor Transaction ID'  => $meta['_cybs_processor_transaction_id'],
@@ -922,10 +1205,5 @@ class WC_Gateway_Cybs_REST extends WC_Payment_Gateway {
 			),
 			static function ( $value ) { return '' !== (string) $value; }
 		);
-	}
-
-	private function commerce_indicator( $card_type, array $auth ) {
-		if ( 'yes' !== $this->enable_3ds || empty( $auth ) ) return 'internet';
-		return array( '001' => 'vbv', '002' => 'spa', '003' => 'aesk', '007' => 'js' )[ $card_type ] ?? 'internet';
 	}
 }

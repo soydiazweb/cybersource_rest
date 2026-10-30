@@ -14,6 +14,7 @@ Antes de produccion:
 3. Deshabilitar logs de depuracion del servidor que capturen cuerpos POST.
 4. Proteger WordPress y `/wp-json/cybersource-rest/v1/*` con WAF/rate limiting.
 5. Probar todos los escenarios 3DS entregados por CyberSource.
-6. Verificar expresamente que ECI 0 y ECI 7 nunca generan `/pts/v2/payments`.
+6. Verificar expresamente que ECI 0 y ECI 7 (o ECI ausente) nunca generan `/pts/v2/payments`.
 7. Rotar llaves CyberSource y restringir acceso al administrador.
 8. Migrar HTTP Signature a JWT + MLE antes del retiro anunciado para marzo de 2027.
+9. Habilitar Transaction Search y Transaction Details en Business Center para la reconciliacion.

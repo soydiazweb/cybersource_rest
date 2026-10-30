@@ -66,7 +66,7 @@ final class WC_Cybs_REST_Controller {
 		if ( is_wp_error( $response ) ) return $this->public_error( $response );
 
 		$info = $response['consumerAuthenticationInformation'] ?? array();
-		if ( empty( $info['accessToken'] ) || empty( $info['deviceDataCollectionUrl'] ) || empty( $info['referenceId'] ) ) {
+		if ( empty( $info['accessToken'] ) || empty( $info['deviceDataCollectionUrl'] ) || empty( $info['referenceId'] ) || ! WC_Cybs_REST_Outcome::is_cardinal_url( $info['deviceDataCollectionUrl'] ) ) {
 			return new WP_Error( 'cybs_setup_invalid', __( 'CyberSource no devolvio los datos para iniciar 3-D Secure.', 'cybersource-rest-woocommerce' ), array( 'status' => 502 ) );
 		}
 		return rest_ensure_response(
@@ -122,7 +122,10 @@ final class WC_Cybs_REST_Controller {
 		);
 		$response = $gateway->client()->request( 'POST', '/risk/v1/authentications', $payload, $this->reference_code() );
 		unset( $payload );
-		if ( is_wp_error( $response ) ) return $this->public_error( $response );
+		if ( is_wp_error( $response ) ) {
+			unset( $card );
+			return $this->authentication_error( $response );
+		}
 
 		$status = strtoupper( (string) ( $response['status'] ?? '' ) );
 		$info   = $response['consumerAuthenticationInformation'] ?? array();
@@ -133,7 +136,7 @@ final class WC_Cybs_REST_Controller {
 			return rest_ensure_response( array( 'status' => $status, 'authToken' => $token ) );
 		}
 		unset( $card );
-		if ( 'PENDING_AUTHENTICATION' === $status && ! empty( $info['stepUpUrl'] ) && ! empty( $info['accessToken'] ) ) {
+		if ( 'PENDING_AUTHENTICATION' === $status && ! empty( $info['stepUpUrl'] ) && ! empty( $info['accessToken'] ) && WC_Cybs_REST_Outcome::is_cardinal_url( $info['stepUpUrl'] ) ) {
 			return rest_ensure_response(
 				array(
 					'status'                      => $status,
@@ -167,9 +170,16 @@ final class WC_Cybs_REST_Controller {
 		);
 		$response = $gateway->client()->request( 'POST', '/risk/v1/authentication-results', $payload, $this->reference_code() );
 		unset( $payload );
-		if ( is_wp_error( $response ) ) return $this->public_error( $response );
+		if ( is_wp_error( $response ) ) {
+			unset( $card );
+			return $this->authentication_error( $response );
+		}
 		$status = strtoupper( (string) ( $response['status'] ?? '' ) );
 		$info   = $response['consumerAuthenticationInformation'] ?? array();
+		if ( 'AUTHENTICATION_SUCCESSFUL' !== $status ) {
+			unset( $card );
+			return new WP_Error( 'cybs_auth_failed', $this->issuer_message( $response ), array( 'status' => 402 ) );
+		}
 		$token  = $this->issue_auth_token( $card['number'], $amount, $currency, $status, $info, $request );
 		unset( $card );
 		if ( is_wp_error( $token ) ) return $token;
@@ -188,14 +198,14 @@ final class WC_Cybs_REST_Controller {
 	}
 
 	private function issue_auth_token( $number, $amount, $currency, $status, array $info, WP_REST_Request $request ) {
-		$eci       = (string) ( $info['eci'] ?? $info['eciRaw'] ?? '' );
-		$eci_check = ltrim( $eci, '0' );
-		if ( '' === $eci_check ) $eci_check = '0';
-		if ( in_array( $eci_check, array( '0', '7' ), true ) ) {
-			return new WP_Error( 'cybs_eci_blocked', __( 'La autenticacion devolvio ECI 0 o 7. La transaccion no sera enviada a autorizar.', 'cybersource-rest-woocommerce' ), array( 'status' => 402 ) );
+		// Igual que Interamericano: se decide por ECI (05/06 Visa/Amex/JCB/Discover, 02/01 Mastercard).
+		// ECI 07/00 o ausente (tarjeta no inscrita, autenticacion omitida o no disponible) no se autoriza.
+		$eci = (string) ( $info['eciRaw'] ?? $info['eci'] ?? '' );
+		if ( ! WC_Cybs_REST_Outcome::eci_allows_authorization( $eci ) ) {
+			return new WP_Error( 'cybs_eci_blocked', __( 'Tu banco no pudo verificar la tarjeta con 3-D Secure (tarjeta no inscrita o verificacion no disponible). Por seguridad no se realizo el cobro; intenta con otra tarjeta o comunicate con tu banco.', 'cybersource-rest-woocommerce' ), array( 'status' => 402 ) );
 		}
 		$pares = strtoupper( (string) ( $info['paresStatus'] ?? '' ) );
-		if ( 'AUTHENTICATION_SUCCESSFUL' !== $status || ! in_array( $pares, array( 'Y', 'A', 'I' ), true ) ) {
+		if ( 'AUTHENTICATION_SUCCESSFUL' !== $status || in_array( $pares, array( 'N', 'R' ), true ) ) {
 			return new WP_Error( 'cybs_auth_failed', __( 'El emisor no autentico la tarjeta. Utiliza otra forma de pago.', 'cybersource-rest-woocommerce' ), array( 'status' => 402 ) );
 		}
 		$binding = sanitize_text_field( (string) $request->get_param( 'checkoutBinding' ) );
@@ -218,6 +228,11 @@ final class WC_Cybs_REST_Controller {
 			'expires'          => time() + 10 * MINUTE_IN_SECONDS,
 		);
 		foreach ( $allowed as $field ) if ( isset( $info[ $field ] ) && is_scalar( $info[ $field ] ) ) $data[ $field ] = sanitize_text_field( (string) $info[ $field ] );
+		// Indicador e-commerce devuelto por 3-D Secure: ecommerceIndicator (enrollment) o indicator (validation).
+		$indicator = strtolower( sanitize_text_field( (string) ( $info['ecommerceIndicator'] ?? $info['indicator'] ?? '' ) ) );
+		if ( in_array( $indicator, WC_Cybs_REST_Outcome::COMMERCE_INDICATORS, true ) ) {
+			$data['commerceIndicator'] = $indicator;
+		}
 		$token = str_replace( '-', '', wp_generate_uuid4() );
 		WC()->session->set( 'cybs_auth_' . $token, $data );
 		if ( ! set_transient( 'cybs_auth_' . $token, $data, 10 * MINUTE_IN_SECONDS ) ) {
@@ -304,6 +319,19 @@ final class WC_Cybs_REST_Controller {
 	}
 	private function reference_code() { return 'wc-' . substr( hash( 'sha256', WC()->session->get_customer_id() . '|' . microtime( true ) ), 0, 24 ); }
 	private function gateway() { return new WC_Gateway_Cybs_REST(); }
+	/**
+	 * Un 400 de Payer Authentication puede traer AUTHENTICATION_FAILED (rechazo del emisor)
+	 * en lugar de un error de solicitud; se muestra el mensaje del banco.
+	 */
+	private function authentication_error( WP_Error $error ) {
+		$data     = $error->get_error_data();
+		$response = is_array( $data ) && is_array( $data['response'] ?? null ) ? $data['response'] : array();
+		if ( 'AUTHENTICATION_FAILED' === strtoupper( (string) ( $response['status'] ?? '' ) ) ) {
+			return new WP_Error( 'cybs_auth_failed', $this->issuer_message( $response ), array( 'status' => 402 ) );
+		}
+		return $this->public_error( $error );
+	}
+
 	private function public_error( WP_Error $error ) { return new WP_Error( 'cybs_gateway_error', __( 'CyberSource no pudo completar la operacion. Revisa los datos o intenta otra tarjeta.', 'cybersource-rest-woocommerce' ), array( 'status' => 502, 'internal_code' => $error->get_error_code() ) ); }
 	private function issuer_message( array $response ) { return sanitize_text_field( (string) ( $response['consumerAuthenticationInformation']['cardholderMessage'] ?? __( 'El banco no autentico la tarjeta. Utiliza otra forma de pago.', 'cybersource-rest-woocommerce' ) ) ); }
 }

@@ -3,20 +3,20 @@
  * Plugin Name: CyberSource REST para WooCommerce
  * Plugin URI:  https://www.soydiaz.com
  * Description: Pasarela CyberSource REST con Payer Authentication 3-D Secure, device fingerprint, ambientes de pruebas/produccion y logs sanitizados.
- * Version:     1.1.4
+ * Version:     1.2.0
  * Author:      www.soydiaz.com
  * Author URI:  https://www.soydiaz.com
  * Text Domain: cybersource-rest-woocommerce
  * Requires at least: 6.4
  * Requires PHP: 7.4
  * WC requires at least: 8.3
- * WC tested up to: 10.0
+ * WC tested up to: 11.2
  * License: GPL-2.0-or-later
  */
 
 defined( 'ABSPATH' ) || exit;
 
-define( 'WC_CYBS_REST_VERSION', '1.1.4' );
+define( 'WC_CYBS_REST_VERSION', '1.2.0' );
 define( 'WC_CYBS_REST_FILE', __FILE__ );
 define( 'WC_CYBS_REST_PATH', plugin_dir_path( __FILE__ ) );
 define( 'WC_CYBS_REST_URL', plugin_dir_url( __FILE__ ) );
@@ -47,10 +47,13 @@ add_action(
 		require_once WC_CYBS_REST_PATH . 'includes/class-wc-cybs-rest-sanitizer.php';
 		require_once WC_CYBS_REST_PATH . 'includes/class-wc-cybs-rest-logger.php';
 		require_once WC_CYBS_REST_PATH . 'includes/class-wc-cybs-rest-client.php';
+		require_once WC_CYBS_REST_PATH . 'includes/class-wc-cybs-rest-outcome.php';
 		require_once WC_CYBS_REST_PATH . 'includes/class-wc-gateway-cybs-rest.php';
 		require_once WC_CYBS_REST_PATH . 'includes/class-wc-cybs-rest-controller.php';
+		require_once WC_CYBS_REST_PATH . 'includes/class-wc-cybs-rest-reconciler.php';
 
 		WC_Cybs_REST_Controller::instance();
+		WC_Cybs_REST_Reconciler::init();
 	},
 	11
 );
@@ -96,5 +99,12 @@ register_activation_hook(
 				)
 			);
 		}
+	}
+);
+
+register_deactivation_hook(
+	__FILE__,
+	static function () {
+		wp_clear_scheduled_hook( 'wc_cybs_rest_reconcile' );
 	}
 );
