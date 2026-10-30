@@ -36,10 +36,9 @@ ambientes separados y logs sanitizados.
 * No guarda el numero completo de tarjeta ni el CVV en pedidos, metadatos o logs.
 * Limite basico de intentos en endpoints de autenticacion para reducir card testing.
 
-== Trabajo realizado en 1.2.0 (alineacion con Colegio Interamericano) ==
+== Trabajo realizado en 1.2.0 ==
 
-Se comparo el plugin con el modulo de pagos REST de Colegio Interamericano
-(pagos_interamericano) y se cubrieron los escenarios que faltaban:
+Se cubrieron los escenarios que faltaban:
 
 1. AUTHORIZED_RISK_DECLINED (el banco aprueba y Decision Manager rechaza): antes el
    pedido quedaba "en espera" con el dinero retenido. Ahora se libera la autorizacion
@@ -62,7 +61,7 @@ Se comparo el plugin con el modulo de pagos REST de Colegio Interamericano
    consulta el resultado final de la revision.
 8. Mensajes al cliente por motivo (fondos insuficientes, CVV incorrecto, tarjeta
    vencida, rechazo por riesgo, etc.) en lugar de un mensaje generico.
-9. 3-D Secure: la decision se toma por ECI (05/06/02/01) como en Interamericano; ya no se
+9. 3-D Secure: la decision se toma por ECI (05/06/02/01); ya no se
    exige paresStatus Y/A/I (solo se rechaza N o R explicitos).
 10. Un HTTP 400 con AUTHENTICATION_FAILED en enrollment/validation muestra el mensaje del
     banco en lugar de un error tecnico.
@@ -87,7 +86,7 @@ Reconciliacion:
 Metadatos nuevos del pedido: _cybs_attempt, _cybs_attempt_reference, _cybs_reconcile,
 _cybs_reconcile_since, _cybs_release_type, _cybs_release_id, _cybs_release_status.
 
-Pendiente (no incluido): capturar la tarjeta con Microform (como Interamericano) para
+Pendiente (no incluido): capturar la tarjeta con Microform para
 que el PAN y el CVV no pasen por el servidor y reducir el alcance PCI DSS.
 
 == Instalacion ==
