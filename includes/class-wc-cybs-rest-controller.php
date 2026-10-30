@@ -198,7 +198,7 @@ final class WC_Cybs_REST_Controller {
 	}
 
 	private function issue_auth_token( $number, $amount, $currency, $status, array $info, WP_REST_Request $request ) {
-		// Igual que Interamericano: se decide por ECI (05/06 Visa/Amex/JCB/Discover, 02/01 Mastercard).
+		// Se decide por ECI (05/06 Visa/Amex/JCB/Discover, 02/01 Mastercard).
 		// ECI 07/00 o ausente (tarjeta no inscrita, autenticacion omitida o no disponible) no se autoriza.
 		$eci = (string) ( $info['eciRaw'] ?? $info['eci'] ?? '' );
 		if ( ! WC_Cybs_REST_Outcome::eci_allows_authorization( $eci ) ) {

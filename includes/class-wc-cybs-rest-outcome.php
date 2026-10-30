@@ -5,7 +5,7 @@ defined( 'ABSPATH' ) || exit;
 /**
  * Reglas de decision puras (sin I/O) para respuestas de CyberSource.
  *
- * Replica el criterio del modulo de pagos de Colegio Interamericano:
+ * Criterio:
  * - Ante cualquier duda el resultado es "unknown" (se reconcilia), nunca se
  *   asume aprobacion ni se permite reintentar el cobro.
  * - AUTHORIZED_RISK_DECLINED y PARTIAL_AUTHORIZED se liberan (reversa/void).

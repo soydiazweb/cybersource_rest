@@ -5,7 +5,7 @@ Author: www.soydiaz.com
 Author URI: https://www.soydiaz.com
 Requires at least: 6.4
 Requires PHP: 7.4
-Stable tag: 1.2.0
+Stable tag: 1.2.1
 WC tested up to: 11.2
 License: GPLv2 or later
 
@@ -38,7 +38,7 @@ ambientes separados y logs sanitizados.
 
 == Trabajo realizado en 1.2.0 ==
 
-Se cubrieron los escenarios que faltaban:
+Se revisaron los escenarios de pago no cubiertos y se agregaron:
 
 1. AUTHORIZED_RISK_DECLINED (el banco aprueba y Decision Manager rechaza): antes el
    pedido quedaba "en espera" con el dinero retenido. Ahora se libera la autorizacion
@@ -147,6 +147,9 @@ paquete ni deben utilizarse en Produccion.
 * TARJETAS DE PRUEBA 3DS 1.xlsx
 
 == Changelog ==
+
+= 1.2.1 =
+* Limpieza de comentarios y documentacion; sin cambios funcionales.
 
 = 1.2.0 =
 * Libera automaticamente (reversa y luego void) las autorizaciones AUTHORIZED_RISK_DECLINED y PARTIAL_AUTHORIZED.
